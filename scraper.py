@@ -1,19 +1,22 @@
 """
 PDPC Decisions Scraper
-Extracts all "Protection" obligation decisions from https://www.pdpc.gov.sg/all-commissions-decisions
-and writes them to pdpc_decisions.xlsx
+Extracts the Protection Obligation decisions from PDPC's enforcement decisions
+(https://www.pdpc.gov.sg/organisations/regulations-decisions/enforcement-decisions)
+and writes them to pdpc_decisions.xlsx.
 
-Uses Playwright for JS-rendered pagination, requests+BeautifulSoup for detail pages.
+The site is server-rendered: the listing page embeds an index of every decision, and each decision
+page carries its date, summary and PDF. Plain requests + BeautifulSoup; no browser.
 """
 
+import argparse
 import io
+import json
 import re
 import time
 import requests
 from bs4 import BeautifulSoup
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 from pypdf import PdfReader
 
 # ---------------------------------------------------------------------------
@@ -21,7 +24,7 @@ from pypdf import PdfReader
 # ---------------------------------------------------------------------------
 
 BASE_URL     = "https://www.pdpc.gov.sg"
-LISTING_URL  = f"{BASE_URL}/all-commissions-decisions"
+LISTING_URL  = f"{BASE_URL}/organisations/regulations-decisions/enforcement-decisions?type=Commission%27s+Decisions"
 OUTPUT_FILE  = "pdpc_decisions.xlsx"
 
 HEADERS = {
@@ -160,188 +163,135 @@ def extract_description(rte_soup) -> str:
     return rte_soup.get_text(" ", strip=True)[:600]
 
 # ---------------------------------------------------------------------------
-# Phase 1: Use Playwright to get all listings with Protection filter
+# Phase 1: the listing. The enforcement decisions page is server-rendered (Next.js) and embeds an index of
+# every decision (title and link) in its page data, so one request lists them all; no browser needed.
 # ---------------------------------------------------------------------------
 
-def fetch_all_listings_playwright() -> list[dict]:
-    """
-    Use a headless browser to:
-    1. Navigate to the all-commissions-decisions page
-    2. Tick the Protection checkbox
-    3. Paginate through all pages, collecting decision metadata
-    """
-    print("Phase 1: Launching browser to scrape listing pages...")
-    items = []
+INDEX_ITEM_RE = re.compile(
+    r'\{"label":"((?:[^"\\]|\\.)*)","url":"(/organisations/regulations-decisions/enforcement-decisions/[^"]+)",'
+    r'"isListingDetail":true'
+)
 
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
-        page = browser.new_page(user_agent=HEADERS["User-Agent"])
+OBLIGATIONS = [
+    "Protection", "Accountability", "Consent", "Notification", "Purpose Limitation", "Openness", "Access",
+    "Correction", "Accuracy", "Retention Limitation", "Transfer Limitation", "Data Breach Notification",
+]
 
-        # Intercept API responses to capture raw JSON data
-        captured_items = []
 
-        def handle_response(response):
-            if "getenforcementcase" in response.url and response.status == 200:
-                try:
-                    data = response.json()
-                    if "items" in data:
-                        captured_items.extend(data["items"])
-                except Exception:
-                    pass
+def page_data(html: str) -> str:
+    """The Next.js flight data embedded in a page (self.__next_f.push chunks), decoded."""
+    chunks = re.findall(r'self\.__next_f\.push\(\[1,"(.*?)"\]\)', html, re.S)
+    return "".join(json.loads('"' + c + '"') for c in chunks)
 
-        page.on("response", handle_response)
 
-        print(f"  Navigating to {LISTING_URL} ...")
-        page.goto(LISTING_URL, wait_until="networkidle", timeout=30000)
+def resolve_reference(data: str, value: str) -> str:
+    """Next.js sends long strings as separate text rows ("27:T<hex byte length>,<text>") and refers to them as
+    "$27"; return the text a reference points to, or the value unchanged."""
+    ref = re.fullmatch(r"\$([0-9a-f]+)", value)
+    if not ref:
+        return value
+    row = re.search(rf"(?:^|\n){ref.group(1)}:T([0-9a-f]+),", data)
+    if not row:
+        return value
+    return data[row.end():].encode("utf-8")[: int(row.group(1), 16)].decode("utf-8", "ignore")
 
-        # Tick the Protection checkbox
-        print("  Applying Protection filter...")
-        try:
-            # Try multiple selector approaches
-            protection_cb = page.locator(
-                "input[type='checkbox'][id='protection'], "
-                "input[type='checkbox'][value='protection'], "
-                "input[type='checkbox'][value='Protection']"
-            ).first
-            protection_cb.check()
-            # Wait for the listing to update after filter is applied
-            page.wait_for_load_state("networkidle", timeout=10000)
-        except PWTimeout:
-            print("  Warning: networkidle timeout after filter — continuing anyway")
-        except Exception as e:
-            print(f"  Warning: could not tick Protection checkbox: {e}")
-            print("  Proceeding without filter — will filter client-side")
 
-        # Find out how many pages there are
-        try:
-            total_pages_el = page.locator(".total-pages").first
-            total_pages = int(total_pages_el.inner_text(timeout=5000).strip())
-        except Exception:
-            total_pages = 1
-        print(f"  Detected {total_pages} page(s) of results")
+def obligations_in(title: str) -> list[str]:
+    """Obligations named in a decision title, e.g. 'Breach of the Accountability and Protection Obligations'."""
+    found = [o for o in OBLIGATIONS if re.search(rf"\b{o}\b", title, re.IGNORECASE)]
+    # "Data Breach Notification" also contains "Notification"
+    if "Data Breach Notification" in found and not re.search(r"(?<!Breach )\bNotification\b", title):
+        found.remove("Notification")
+    return found
 
-        # Scrape current page items from the DOM as well (belt-and-suspenders)
-        def scrape_page_items():
-            cards = page.locator(".card").all()
-            page_items = []
-            for card in cards:
-                try:
-                    title = card.locator(".card__title").inner_text(timeout=2000).strip()
-                    descs = card.locator(".card__desc").all()
-                    nature   = descs[0].inner_text(timeout=1000).replace("Relevant DP obligation(s):", "").strip() if len(descs) > 0 else ""
-                    decision = descs[1].inner_text(timeout=1000).replace("Decision:", "").strip() if len(descs) > 1 else ""
-                    date_txt = descs[2].inner_text(timeout=1000).replace("Published Date:", "").strip() if len(descs) > 2 else ""
-                    href = card.get_attribute("href") or ""
-                    page_items.append({
-                        "title": title,
-                        "nature": nature,
-                        "decision": decision,
-                        "date": date_txt,
-                        "url": href,
-                    })
-                except Exception:
-                    pass
-            return page_items
 
-        # Collect items from page 1
-        dom_items = scrape_page_items()
-        if dom_items:
-            items.extend(dom_items)
-            print(f"  Page 1/{total_pages} — {len(items)} items so far (DOM)")
-
-        # Navigate through remaining pages
-        for page_num in range(2, total_pages + 1):
-            try:
-                # Click the "Next" pagination button
-                next_btn = page.locator(".pagination-next a, a[data-page]").filter(
-                    has_text=str(page_num)
-                ).first
-                if not next_btn.is_visible(timeout=2000):
-                    # Fallback: click the generic "Next" button
-                    next_btn = page.locator(".pagination-next a").first
-
-                next_btn.click(timeout=5000)
-                page.wait_for_load_state("networkidle", timeout=10000)
-            except PWTimeout:
-                print(f"  Timeout on page {page_num} navigation — continuing")
-            except Exception as e:
-                print(f"  Navigation error on page {page_num}: {e}")
-                break
-
-            dom_items = scrape_page_items()
-            if dom_items:
-                items.extend(dom_items)
-            print(f"  Page {page_num}/{total_pages} — {len(items)} items so far")
-
-        browser.close()
-
-    # If API interception captured items, prefer those (they have cleaner data)
-    if captured_items:
-        print(f"  API interception captured {len(captured_items)} items (using these)")
-        items = captured_items
-
-    # Deduplicate by URL
-    seen_urls = set()
-    unique_items = []
-    for item in items:
-        url = item.get("url", "")
-        if url and url not in seen_urls:
-            seen_urls.add(url)
-            unique_items.append(item)
-
-    # Filter for Protection obligation (client-side safety net)
-    protection_items = [
-        i for i in unique_items
-        if "protection" in i.get("nature", "").lower()
-    ]
-
-    print(f"  Total unique Protection decisions: {len(protection_items)}")
-    return protection_items
+def fetch_listings(session: requests.Session) -> list[dict]:
+    print(f"Phase 1: Reading the decision index from {LISTING_URL} ...")
+    resp = safe_get(session, LISTING_URL)
+    if resp is None:
+        return []
+    items, seen = [], set()
+    for m in INDEX_ITEM_RE.finditer(page_data(resp.text)):
+        url = m.group(2)
+        if url in seen:
+            continue
+        seen.add(url)
+        items.append({"title": json.loads('"' + m.group(1) + '"'), "url": url})
+    print(f"  {len(items)} decisions in the index")
+    return items
 
 # ---------------------------------------------------------------------------
-# Phase 2: Fetch each detail page
+# Phase 2: each decision page: published date, summary (with the penalty) and the decision PDF
 # ---------------------------------------------------------------------------
 
-def fetch_detail(session: requests.Session, item: dict) -> dict:
-    """Fetch an individual decision page and return enriched row data."""
-    relative_url = item.get("url", "")
-    full_url = BASE_URL + relative_url if relative_url.startswith("/") else relative_url
+CONTENT_RE = re.compile(r'"data":\{"content":"((?:[^"\\]|\\.)*)"\}')
 
-    raw_title = item.get("title", "")
-    row = {
-        "case_name":     normalise_case_name(raw_title),
-        "citation":      "",
-        "date":          item.get("date", ""),
-        "obligations":   item.get("nature", ""),
-        "decision_type": item.get("decision", ""),
-        "description":   "",
-        "penalty":       "",
-        "url":           full_url,
-    }
 
+def decision_types(summary: str) -> str:
+    lower = summary.lower()
+    kinds = []
+    if re.search(r"no breach|not (?:to be )?in breach|did not breach", lower):
+        kinds.append("Not in Breach")
+    if re.search(r"financial penalt(?:y|ies)|penalt(?:y|ies) of", lower):
+        kinds.append("Financial Penalty")
+    if re.search(r"\bdirections?\b", lower):
+        kinds.append("Directions")
+    if "warning" in lower:
+        kinds.append("Warning")
+    if "undertaking" in lower:
+        kinds.append("Undertaking")
+    return ", ".join(kinds)
+
+
+def fetch_detail(session: requests.Session, item: dict, read_pdf: bool = True) -> dict | None:
+    """One decision as a row, or None if the page can't be read."""
+    full_url = BASE_URL + item["url"]
     resp = safe_get(session, full_url)
     if resp is None:
-        return row
+        return None
+    soup = BeautifulSoup(resp.text, "html.parser")
+    data = page_data(resp.text)
 
-    soup = BeautifulSoup(resp.text, "lxml")
+    date_el = soup.select_one(".page-banner__date")
+    date = re.sub(r"^\s*Published on\s*", "", date_el.get_text(" ", strip=True)) if date_el else ""
 
-    rte = soup.select_one(".rte")
-    rte_text = rte.get_text(" ", strip=True) if rte else ""
+    match = CONTENT_RE.search(data)
+    content = BeautifulSoup(resolve_reference(data, json.loads('"' + match.group(1) + '"')), "html.parser") if match else None
+    summary = re.sub(r"\s*Click here to find out more\.?\s*$", "", content.get_text(" ", strip=True)) if content else ""
 
-    # Citation: extract from the decision PDF (most reliable source)
-    pdf_link = soup.find("a", href=PDF_LINK_RE)
-    if pdf_link:
-        pdf_href = pdf_link.get("href", "")
-        pdf_url = BASE_URL + pdf_href if pdf_href.startswith("/") else pdf_href
-        row["citation"] = extract_citation_from_pdf(session, pdf_url)
-    # Fallback: search page text (catches some older pages)
-    if not row["citation"]:
-        row["citation"] = extract_citation(soup.get_text(" ", strip=True))
+    pdf_url = ""
+    if content:
+        for a in content.find_all("a", href=True):
+            href = a["href"]
+            if href.startswith("/assets/") or PDF_LINK_RE.search(href):
+                pdf_url = BASE_URL + href if href.startswith("/") else href
+                break
 
-    row["description"] = extract_description(rte)
-    row["penalty"]     = extract_penalty(rte_text)
+    title = item["title"]
+    citation = extract_citation(summary)
+    if not citation and pdf_url and read_pdf:
+        citation = extract_citation_from_pdf(session, pdf_url)
 
-    return row
+    return {
+        "case_name":     normalise_case_name(title),
+        "citation":      citation,
+        "date":          date,
+        "obligations":   ", ".join(obligations_in(title)),
+        "decision_type": decision_types(summary),
+        "description":   summary,
+        "penalty":       extract_penalty(summary),
+        "url":           full_url,
+        "title":         title,
+        "summary_lower": summary.lower(),
+    }
+
+
+def is_protection_case(row: dict) -> bool:
+    """Protection Obligation cases: named in the title, or (older 'Data Protection Provisions' titles and
+    undertakings) described in the summary."""
+    if "Protection" in row["obligations"].split(", "):
+        return True
+    return bool(re.search(r"protection obligation|section 24\b", row["summary_lower"]))
 
 # ---------------------------------------------------------------------------
 # Phase 3: Write Excel
@@ -406,26 +356,37 @@ def write_excel(rows: list[dict], filename: str = OUTPUT_FILE) -> None:
 # ---------------------------------------------------------------------------
 
 def main():
-    # Phase 1: collect all Protection listings via browser
-    listings = fetch_all_listings_playwright()
+    parser = argparse.ArgumentParser(description="Scrape PDPC Protection Obligation decisions into Excel.")
+    parser.add_argument("--output", default=OUTPUT_FILE, help=f"Excel file to write (default: {OUTPUT_FILE}).")
+    parser.add_argument("--limit", type=int, default=0, help="Stop after this many decision pages (for a quick check).")
+    parser.add_argument("--delay", type=float, default=DELAY_DETAIL, help="Seconds between decision pages.")
+    parser.add_argument("--no-pdf", action="store_true", help="Skip downloading PDFs to find citations.")
+    args = parser.parse_args()
+
+    session = requests.Session()
+    listings = fetch_listings(session)
     if not listings:
         print("No listings found. Exiting.")
         return
+    if args.limit:
+        listings = listings[:args.limit]
 
-    # Phase 2: enrich each with detail page data
-    session = requests.Session()
-    print(f"\nPhase 2: Fetching detail pages for {len(listings)} decisions...")
+    # Phase 2: every decision page; keep the Protection Obligation cases
+    print(f"\nPhase 2: Reading {len(listings)} decision pages...")
     rows = []
     for i, item in enumerate(listings, start=1):
-        title_preview = item.get("title", "")[:70]
-        print(f"  [{i:3d}/{len(listings)}] {title_preview}")
-        row = fetch_detail(session, item)
-        rows.append(row)
-        time.sleep(DELAY_DETAIL)
+        row = fetch_detail(session, item, read_pdf=not args.no_pdf)
+        if row and is_protection_case(row):
+            if not row["obligations"]:
+                row["obligations"] = "Protection"  # older titles say "Data Protection Provisions"
+            rows.append(row)
+            print(f"  [{i:3d}/{len(listings)}] {row['title'][:70]}")
+        time.sleep(args.delay)
+    print(f"  {len(rows)} Protection Obligation decisions")
 
     # Phase 3: write Excel
     print("\nPhase 3: Writing Excel file...")
-    write_excel(rows)
+    write_excel(rows, args.output)
     print("Done.")
 
 
