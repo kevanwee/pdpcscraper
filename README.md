@@ -21,8 +21,9 @@ A Python toolkit that scrapes all PDPC (Personal Data Protection Commission) enf
 
 ```bash
 pip install -r requirements.txt
-python -m playwright install chromium
 ```
+
+No browser is needed.
 
 ---
 
@@ -31,17 +32,21 @@ python -m playwright install chromium
 ### Usage
 
 ```bash
-python scraper.py
+python scraper.py                 # every Protection Obligation decision (~20 minutes)
+python scraper.py --limit 20      # the first 20 decision pages, for a quick check
+python scraper.py --no-pdf        # skip the PDFs (faster; fewer citations)
+python scraper.py --output out.xlsx --delay 2
 ```
 
 ### What it does
 
-1. Launches a headless browser, navigates to the [PDPC decisions page](https://www.pdpc.gov.sg/all-commissions-decisions), applies the **Protection** filter, and paginates through all 34 pages
-2. Visits each individual decision page to extract the summary description and financial penalty
-3. Downloads each decision PDF to extract the neutral case citation
-4. Writes everything to `pdpc_decisions.xlsx`
+1. Reads the [enforcement decisions page](https://www.pdpc.gov.sg/organisations/regulations-decisions/enforcement-decisions?type=Commission%27s+Decisions). The site is server-rendered (Next.js) and embeds an index of every decision (about 390), so one request lists them all.
+2. Visits each decision page for its published date, summary and financial penalty. Obligations come from the title; the decision type (financial penalty, directions, warning, not in breach) from the summary.
+3. Keeps the Protection Obligation decisions: those whose title names the Protection Obligation, plus older "Data Protection Provisions" decisions and undertakings whose summary does.
+4. Downloads each decision PDF to extract the neutral case citation.
+5. Writes everything to `pdpc_decisions.xlsx`.
 
-Expected runtime: ~15 minutes (~210 decisions, due to PDF downloads).
+Expected runtime: ~20 minutes (about 390 pages at 1.5 seconds, plus PDFs).
 
 ### Output — `pdpc_decisions.xlsx`
 
@@ -97,19 +102,19 @@ Six-panel chart covering:
 5. Decision outcome breakdown (pie chart)
 6. Obligations co-occurring with Protection
 
-### Key findings (as of Mar 2026)
+### Key findings (as of Oct 2026)
 
 | Metric | Value |
 |--------|-------|
-| Total decisions | 211 |
+| Total decisions | 216 |
 | Date range | 2016 – 2026 |
-| With financial penalty | 139 (66%) |
-| Total penalties imposed | $3,498,050 |
-| Average penalty | $25,165 |
-| Median penalty | $11,000 |
+| With financial penalty | 140 (65%) |
+| Total penalties imposed | $3,569,550 |
+| Average penalty | $25,496 |
+| Median penalty | $11,500 |
 | Largest single penalty | $315,000 |
-| Protection-only cases | 175 (83%) |
-| Most common co-obligation | Accountability (28 cases) |
+| Protection-only cases | 183 (85%) |
+| Most common co-obligation | Accountability (22 cases) |
 
 ---
 
@@ -117,10 +122,9 @@ Six-panel chart covering:
 
 | Package | Purpose |
 |---------|---------|
-| `playwright` | Headless browser for JS-rendered listing pages |
-| `requests` | HTTP client for detail pages and PDFs |
-| `beautifulsoup4` + `lxml` | HTML parsing |
+| `requests` | HTTP client for the listing, decision pages and PDFs |
+| `beautifulsoup4` | HTML parsing |
 | `pypdf` | PDF text extraction for case citations |
 | `openpyxl` | Excel output |
-| `matplotlib` + `seaborn` | Charts |
+| `matplotlib` | Charts |
 | `numpy` | Aggregation helpers |
